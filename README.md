@@ -13,11 +13,14 @@ codexwait 01a1302e-0872-79b2-98c2-93f4299c6339
 # Unique UUID prefix
 codexwait 01a1302e-0872
 
-# Most recent session
-codexwait --last
+# Most recent session (explicit cwd required for safety)
+codexwait --last --cwd /path/to/project
 
 # Retry every 15 minutes
 codexwait --interval 900 01a1302e-0872
+
+# Override the recorded working directory
+codexwait --cwd /path/to/project 01a1302e-0872
 
 # Keep a Mac awake while waiting
 codexwait --keep-awake 01a1302e-0872
@@ -39,6 +42,28 @@ codexwait: session prefix '01a1302e' is ambiguous:
 
 This filesystem layout is an implementation detail of Codex rather than a stable public API, so a future Codex release may require an update to `codexwait`.
 
+
+## Working directory safety
+
+`codex exec resume` can resume a thread from the caller's current directory instead of the directory recorded in the thread. That is dangerous for an unattended retry wrapper because the model may continue work in the wrong repository.
+
+For an explicit UUID or UUID prefix, `codexwait` reads the creation-time `session_meta.cwd` from the session rollout and resumes from that directory. It deliberately does **not** use the latest `turn_context.cwd`: a failed or accidental resume from the wrong repository can itself append a newer turn context and would otherwise poison future retries. It prints the selected directory before starting Codex:
+
+```text
+Resolved session: 01a1302e-0872-79b2-98c2-93f4299c6339
+Session cwd: /Users/me/src/project
+Current cwd: /Users/me/src/codexwait
+Resuming from session cwd.
+```
+
+The original recorded directory must still exist. If the session was intentionally moved to another checkout/worktree, override it explicitly:
+
+```sh
+codexwait --cwd /new/path/to/project 01a1302e-0872
+```
+
+`--last` and named sessions cannot currently be mapped to rollout metadata safely by `codexwait`, so they require `--cwd DIR`. The Nix package includes `jq`, which is used to read rollout JSONL metadata. When running `src/codexwait.sh` directly, install `jq` or use `--cwd DIR`.
+
 ## Resume prompt
 
 The default prompt is intentionally conservative:
@@ -57,6 +82,7 @@ or `CODEXWAIT_PROMPT`.
 
 - Successful Codex exit: stop.
 - Usage/rate-limit-looking failure: wait and retry.
+- Explicit UUID/prefix sessions resume from their recorded working directory unless `--cwd` overrides it.
 - Codex reports that the session already has an active writer: stop and ask you to close the existing Codex session first.
 - Any other non-zero exit: stop immediately.
 - Ambiguous session prefix: stop before running Codex and suggest longer prefixes.

@@ -8,10 +8,20 @@ trap 'rm -rf "$TMP"' EXIT
 export CODEX_HOME="$TMP/codex"
 export CODEXWAIT_LOCK_DIR="$TMP/locks"
 export HOME="$TMP/home"
-mkdir -p "$CODEX_HOME/sessions/2026/10/13" "$HOME" "$TMP/bin" "$CODEXWAIT_LOCK_DIR"
+SESSION_CWD="$TMP/project"
+ALT_CWD="$TMP/alternate-project"
+mkdir -p "$CODEX_HOME/sessions/2026/10/13" "$HOME" "$TMP/bin" "$CODEXWAIT_LOCK_DIR" "$SESSION_CWD" "$ALT_CWD"
+# macOS exposes /var through /private/var; compare physical paths so tests do not
+# fail only because mktemp returns the symlinked spelling.
+SESSION_CWD_REAL="$(cd "$SESSION_CWD" && pwd -P)"
+ALT_CWD_REAL="$(cd "$ALT_CWD" && pwd -P)"
 
 UUID='01a1302e-0872-79b2-98c2-93f4299c6339'
-touch "$CODEX_HOME/sessions/2026/10/13/rollout-2026-10-13T00-00-00-$UUID.jsonl"
+ROLLOUT="$CODEX_HOME/sessions/2026/10/13/rollout-2026-10-13T00-00-00-$UUID.jsonl"
+printf '%s\n' \
+  "{\"timestamp\":\"2026-10-13T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"meta\":{\"cwd\":\"$SESSION_CWD\"}}}" \
+  "{\"timestamp\":\"2026-10-13T00:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"cwd\":\"$ALT_CWD\"}}" \
+  > "$ROLLOUT"
 
 cat > "$TMP/bin/codex" <<'SCRIPT'
 #!/usr/bin/env bash
@@ -22,6 +32,7 @@ count=0
 count=$((count + 1))
 printf '%s' "$count" > "$count_file"
 printf '%s\n' "$*" >> "${CODEXWAIT_TEST_ARGS:?}"
+pwd >> "${CODEXWAIT_TEST_PWD:?}"
 
 case "${CODEXWAIT_TEST_MODE:-limit-then-success}" in
   limit-then-success)
@@ -52,24 +63,64 @@ chmod +x "$TMP/bin/codex"
 export PATH="$TMP/bin:$PATH"
 export CODEXWAIT_TEST_COUNT="$TMP/count"
 export CODEXWAIT_TEST_ARGS="$TMP/args"
+export CODEXWAIT_TEST_PWD="$TMP/pwd"
 
 reset_fake() {
-  rm -f "$CODEXWAIT_TEST_COUNT" "$CODEXWAIT_TEST_ARGS"
+  rm -f "$CODEXWAIT_TEST_COUNT" "$CODEXWAIT_TEST_ARGS" "$CODEXWAIT_TEST_PWD"
   : > "$CODEXWAIT_TEST_ARGS"
+  : > "$CODEXWAIT_TEST_PWD"
 }
 
+assert_all_pwd() {
+  local expected="$1"
+  [[ -s "$CODEXWAIT_TEST_PWD" ]]
+  while IFS= read -r actual; do
+    [[ "$actual" == "$expected" ]] || {
+      echo "expected Codex cwd '$expected', got '$actual'" >&2
+      exit 1
+    }
+  done < "$CODEXWAIT_TEST_PWD"
+}
+
+# Explicit UUID/prefix should restore the creation-time session cwd. A later
+# turn_context deliberately points somewhere else to model a bad resume attempt.
 export CODEXWAIT_TEST_MODE=limit-then-success
 reset_fake
-CODEXWAIT_INTERVAL=1 "$ROOT/src/codexwait.sh" 01a1302e-0872 >/dev/null
-
+(
+  cd "$TMP"
+  CODEXWAIT_INTERVAL=1 "$ROOT/src/codexwait.sh" 01a1302e-0872 >/dev/null
+)
 grep -q "$UUID" "$CODEXWAIT_TEST_ARGS"
 [[ "$(cat "$CODEXWAIT_TEST_COUNT")" == "2" ]]
+assert_all_pwd "$SESSION_CWD_REAL"
+echo "ok: prefix resolution + limit retry + original session cwd"
 
-echo "ok: prefix resolution + limit retry"
+# --cwd must override rollout metadata.
+export CODEXWAIT_TEST_MODE=success
+reset_fake
+(
+  cd "$TMP"
+  "$ROOT/src/codexwait.sh" --cwd "$ALT_CWD" "$UUID" >/dev/null
+)
+[[ "$(cat "$CODEXWAIT_TEST_COUNT")" == "1" ]]
+assert_all_pwd "$ALT_CWD_REAL"
+echo "ok: explicit cwd override"
+
+# --last is unsafe without an explicit cwd because codex exec resume would inherit caller cwd.
+reset_fake
+last_err="$TMP/last.err"
+if "$ROOT/src/codexwait.sh" --last >/dev/null 2>"$last_err"; then
+  echo "expected --last without --cwd to fail" >&2
+  exit 1
+fi
+[[ ! -s "$CODEXWAIT_TEST_ARGS" ]]
+grep -q -- '--last requires --cwd DIR' "$last_err"
+echo "ok: --last requires explicit cwd"
 
 # Ambiguous prefix must fail without invoking Codex and should suggest longer prefixes.
 UUID2='01a1302e-08a4-7343-8254-19d0945b49f1'
-touch "$CODEX_HOME/sessions/2026/10/13/rollout-2026-10-13T00-00-01-$UUID2.jsonl"
+ROLLOUT2="$CODEX_HOME/sessions/2026/10/13/rollout-2026-10-13T00-00-01-$UUID2.jsonl"
+printf '%s\n' "{\"timestamp\":\"2026-10-13T00:00:01Z\",\"type\":\"session_meta\",\"payload\":{\"meta\":{\"cwd\":\"$SESSION_CWD\"}}}" > "$ROLLOUT2"
 reset_fake
 ambiguous_err="$TMP/ambiguous.err"
 if CODEXWAIT_INTERVAL=1 "$ROOT/src/codexwait.sh" 01a1302e >/dev/null 2>"$ambiguous_err"; then
@@ -89,6 +140,7 @@ if "$ROOT/src/codexwait.sh" "$UUID" >/dev/null 2>"$writer_err"; then
   exit 1
 fi
 [[ "$(cat "$CODEXWAIT_TEST_COUNT")" == "1" ]]
+assert_all_pwd "$SESSION_CWD_REAL"
 grep -q 'already open elsewhere' "$writer_err"
 grep -q 'Close the existing Codex session' "$writer_err"
 echo "ok: active writer stops with friendly error"
@@ -99,7 +151,6 @@ reset_fake
 CODEXWAIT_INTERVAL=1 "$ROOT/src/codexwait.sh" --max-attempts 2 "$UUID" >"$TMP/first.out" 2>"$TMP/first.err" &
 first_pid=$!
 
-# Wait for the first waiter to create its reservation lock and enter the sleep loop.
 for _ in $(seq 1 50); do
   if find "$CODEXWAIT_LOCK_DIR" -mindepth 1 -maxdepth 1 -type d -name '*.lock' | grep -q .; then
     break
@@ -115,6 +166,7 @@ if "$ROOT/src/codexwait.sh" "$UUID" >/dev/null 2>"$second_err"; then
 fi
 grep -q 'already reserved by another codexwait process' "$second_err"
 grep -q "$UUID" "$second_err"
+grep -q "target:  $SESSION_CWD_REAL" "$second_err"
 wait "$first_pid" 2>/dev/null || true
 
 echo "ok: duplicate waiter rejected"
@@ -131,10 +183,12 @@ printf '%s\n' '99999999' > "$lock_dir/pid"
 printf '%s\n' "$UUID" > "$lock_dir/session"
 printf '%s\n' 'stale' > "$lock_dir/started_at"
 printf '%s\n' '/tmp/stale' > "$lock_dir/cwd"
+printf '%s\n' "$SESSION_CWD" > "$lock_dir/target_cwd"
 
 export CODEXWAIT_TEST_MODE=success
 reset_fake
 "$ROOT/src/codexwait.sh" "$UUID" >/dev/null
 [[ "$(cat "$CODEXWAIT_TEST_COUNT")" == "1" ]]
+assert_all_pwd "$SESSION_CWD_REAL"
 [[ ! -e "$lock_dir" ]]
 echo "ok: stale waiter lock recovered"

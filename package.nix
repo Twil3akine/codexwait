@@ -1,4 +1,4 @@
-{ lib, writeShellApplication, coreutils, findutils, gnugrep }:
+{ lib, writeShellApplication, coreutils, findutils, gnugrep, jq }:
 
 writeShellApplication {
   name = "codexwait";
@@ -7,6 +7,7 @@ writeShellApplication {
     coreutils
     findutils
     gnugrep
+    jq
   ];
 
   text = builtins.readFile ./src/codexwait.sh;

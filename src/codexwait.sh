@@ -13,6 +13,7 @@ max_attempts="${CODEXWAIT_MAX_ATTEMPTS:-0}"
 keep_awake=0
 use_last=0
 session=""
+cwd_override="${CODEXWAIT_CWD:-}"
 
 usage() {
   cat <<'USAGE'
@@ -29,6 +30,7 @@ Options:
   -i, --interval SEC     Retry interval in seconds (default: 600).
   -p, --prompt TEXT      Prompt appended when resuming.
   --max-attempts N       Stop after N attempts (0 = unlimited, default).
+  -C, --cwd DIR         Override the working directory used to resume.
   --keep-awake           On macOS, use caffeinate while codexwait is running.
   -h, --help             Show this help.
 
@@ -39,6 +41,7 @@ Environment:
   CODEXWAIT_LIMIT_REGEX         Regex used to recognize usage/rate-limit failures.
   CODEXWAIT_ACTIVE_WRITER_REGEX Regex used to recognize Codex active-writer conflicts.
   CODEXWAIT_MAX_ATTEMPTS        Default maximum attempts (0 = unlimited).
+  CODEXWAIT_CWD                 Override the resume working directory.
   CODEXWAIT_LOCK_DIR            Override reservation-lock directory.
 USAGE
 }
@@ -71,6 +74,11 @@ while [[ $# -gt 0 ]]; do
     --max-attempts)
       [[ $# -ge 2 ]] || fail "$1 requires a value"
       max_attempts="$2"
+      shift 2
+      ;;
+    -C|--cwd)
+      [[ $# -ge 2 ]] || fail "$1 requires a value"
+      cwd_override="$2"
       shift 2
       ;;
     --keep-awake)
@@ -200,6 +208,71 @@ elif (( ! use_last )); then
   fail "specify SESSION or --last"
 fi
 
+find_rollout_for_uuid() {
+  local uuid="$1"
+  local sessions_dir="$codex_home/sessions"
+  local best='' file
+
+  [[ -d "$sessions_dir" ]] || return 1
+
+  while IFS= read -r -d '' file; do
+    # Prefer the earliest rollout path for this UUID. A later resume attempt can
+    # record a different turn cwd, but the creation-time session_meta is the
+    # stable project directory we want for unattended resume.
+    if [[ -z "$best" || "$file" < "$best" ]]; then
+      best="$file"
+    fi
+  done < <(find "$sessions_dir" -type f -name "rollout-*-$uuid.jsonl" -print0 2>/dev/null)
+
+  [[ -n "$best" ]] || return 1
+  printf '%s\n' "$best"
+}
+
+read_recorded_cwd() {
+  local rollout="$1"
+  local recorded
+
+  command -v jq >/dev/null 2>&1 || fail "jq is required to read the recorded session cwd; install jq or pass --cwd DIR"
+
+  recorded="$(
+    jq -r '
+      select(.type == "session_meta")
+      | (.payload.meta.cwd // .payload.cwd // empty)
+    ' "$rollout" 2>/dev/null | head -n 1
+  )"
+
+  [[ -n "$recorded" && "$recorded" != "null" ]] || return 1
+  printf '%s\n' "$recorded"
+}
+
+normalize_cwd() {
+  local value="$1"
+  [[ -d "$value" ]] || fail "working directory does not exist: $value"
+  (cd "$value" && pwd -P)
+}
+
+resume_cwd=''
+if [[ -n "$cwd_override" ]]; then
+  resume_cwd="$(normalize_cwd "$cwd_override")"
+elif (( use_last )); then
+  fail "--last requires --cwd DIR so codexwait does not resume the selected session from the wrong repository"
+elif [[ "$session" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+  rollout_file="$(find_rollout_for_uuid "$session" || true)"
+  [[ -n "$rollout_file" ]] || fail "cannot find rollout metadata for session $session; pass --cwd DIR"
+  recorded_cwd="$(read_recorded_cwd "$rollout_file" || true)"
+  [[ -n "$recorded_cwd" ]] || fail "cannot determine the recorded cwd for session $session; pass --cwd DIR"
+  [[ -d "$recorded_cwd" ]] || fail "recorded session cwd no longer exists: $recorded_cwd (use --cwd DIR to override)"
+  resume_cwd="$(normalize_cwd "$recorded_cwd")"
+else
+  fail "named sessions require --cwd DIR because codexwait cannot safely map the name to rollout metadata"
+fi
+
+echo "Session cwd: $resume_cwd"
+if [[ "$(pwd -P)" != "$resume_cwd" ]]; then
+  echo "Current cwd: $(pwd -P)"
+  echo "Resuming from session cwd."
+fi
+
 if [[ -n "${CODEXWAIT_LOCK_DIR:-}" ]]; then
   lock_root="$CODEXWAIT_LOCK_DIR"
 elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
@@ -241,13 +314,15 @@ write_lock_metadata() {
   printf '%s\n' "$lock_target" > "$lock_dir/session"
   printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "$lock_dir/started_at"
   pwd > "$lock_dir/cwd"
+  printf '%s\n' "$resume_cwd" > "$lock_dir/target_cwd"
 }
 
 report_existing_lock() {
-  local owner_pid='unknown' owner_started='unknown' owner_cwd='unknown'
+  local owner_pid='unknown' owner_started='unknown' owner_cwd='unknown' owner_target_cwd='unknown'
   [[ ! -r "$lock_dir/pid" ]] || owner_pid="$(cat "$lock_dir/pid")"
   [[ ! -r "$lock_dir/started_at" ]] || owner_started="$(cat "$lock_dir/started_at")"
   [[ ! -r "$lock_dir/cwd" ]] || owner_cwd="$(cat "$lock_dir/cwd")"
+  [[ ! -r "$lock_dir/target_cwd" ]] || owner_target_cwd="$(cat "$lock_dir/target_cwd")"
 
   cat >&2 <<EOF_LOCK
 codexwait: this session is already reserved by another codexwait process.
@@ -256,6 +331,7 @@ session: $lock_target
 pid:     $owner_pid
 since:   $owner_started
 cwd:     $owner_cwd
+target:  $owner_target_cwd
 EOF_LOCK
 }
 
@@ -307,9 +383,9 @@ while :; do
 
   set +e
   if (( use_last )); then
-    codex exec resume --last "$prompt" 2>&1 | tee "$tmp"
+    (cd "$resume_cwd" && codex exec resume --last "$prompt") 2>&1 | tee "$tmp"
   else
-    codex exec resume "$session" "$prompt" 2>&1 | tee "$tmp"
+    (cd "$resume_cwd" && codex exec resume "$session" "$prompt") 2>&1 | tee "$tmp"
   fi
   status=${PIPESTATUS[0]}
   set -e
