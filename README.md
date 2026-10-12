@@ -1,5 +1,7 @@
 # codexwait
 
+**English** | [日本語](./README.ja.md)
+
 `codexwait` is a small wrapper around the Codex CLI that waits for usage/rate limits to recover and then resumes an existing Codex session.
 
 It retries **only** when the Codex output looks like a usage/rate-limit failure. Other failures stop immediately.
@@ -69,7 +71,6 @@ codexwait: session prefix '01a1302e' is ambiguous:
 ```
 
 This filesystem layout is an implementation detail of Codex rather than a stable public API, so a future Codex release may require an update to `codexwait`.
-
 
 ## Working directory safety
 
