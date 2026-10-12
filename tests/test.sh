@@ -192,3 +192,18 @@ reset_fake
 assert_all_pwd "$SESSION_CWD_REAL"
 [[ ! -e "$lock_dir" ]]
 echo "ok: stale waiter lock recovered"
+
+# list should show sessions newest-first with unique short prefixes and creation-time cwd.
+# Make UUID2 newer than UUID without relying on platform-specific touch -t syntax.
+sleep 1
+touch "$ROLLOUT2"
+list_out="$TMP/list.out"
+"$ROOT/src/codexwait.sh" list --limit 2 >"$list_out"
+first_session_line="$(grep -E '^  01a1302e-' "$list_out" | head -n 1)"
+[[ "$first_session_line" == *'01a1302e-08a'* ]] || {
+  echo "expected newest session first, got: $first_session_line" >&2
+  exit 1
+}
+grep -q '01a1302e-087' "$list_out"
+grep -q "$SESSION_CWD" "$list_out" || grep -q "$SESSION_CWD_REAL" "$list_out"
+echo "ok: recent session list"

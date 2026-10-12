@@ -12,6 +12,8 @@ active_writer_regex="${CODEXWAIT_ACTIVE_WRITER_REGEX:-$DEFAULT_ACTIVE_WRITER_REG
 max_attempts="${CODEXWAIT_MAX_ATTEMPTS:-0}"
 keep_awake=0
 use_last=0
+list_mode=0
+list_limit=10
 session=""
 cwd_override="${CODEXWAIT_CWD:-}"
 
@@ -19,11 +21,15 @@ usage() {
   cat <<'USAGE'
 Usage:
   codexwait [OPTIONS] [SESSION]
+  codexwait list [--limit N]
 
 SESSION may be:
   - a full Codex session UUID
   - a unique UUID prefix (8+ hexadecimal characters, hyphens optional)
   - a Codex session name
+
+Commands:
+  list                   Show recent Codex sessions, newest first.
 
 Options:
   --last                 Resume the most recent session.
@@ -55,6 +61,26 @@ is_uint() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+if [[ "${1:-}" == "list" ]]; then
+  list_mode=1
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--limit)
+        [[ $# -ge 2 ]] || fail "$1 requires a value"
+        list_limit="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "unknown list option: $1"
+        ;;
+    esac
+  done
+else
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --last)
@@ -105,19 +131,17 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+fi
 
 is_uint "$interval" || fail "interval must be a non-negative integer"
 (( interval > 0 )) || fail "interval must be greater than zero"
 is_uint "$max_attempts" || fail "max-attempts must be a non-negative integer"
+is_uint "$list_limit" || fail "list limit must be a positive integer"
+(( list_limit > 0 )) || fail "list limit must be greater than zero"
 
 if (( use_last )) && [[ -n "$session" ]]; then
   fail "--last and SESSION cannot be used together"
 fi
-
-command -v codex >/dev/null 2>&1 || {
-  echo "codexwait: codex command not found" >&2
-  exit 127
-}
 
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 
@@ -201,11 +225,13 @@ resolve_session() {
   esac
 }
 
-if [[ -n "$session" ]]; then
-  session="$(resolve_session "$session")"
-  echo "Resolved session: $session"
-elif (( ! use_last )); then
-  fail "specify SESSION or --last"
+if (( ! list_mode )); then
+  if [[ -n "$session" ]]; then
+    session="$(resolve_session "$session")"
+    echo "Resolved session: $session"
+  elif (( ! use_last )); then
+    fail "specify SESSION or --last"
+  fi
 fi
 
 find_rollout_for_uuid() {
@@ -249,6 +275,100 @@ normalize_cwd() {
   local value="$1"
   [[ -d "$value" ]] || fail "working directory does not exist: $value"
   (cd "$value" && pwd -P)
+}
+
+file_mtime_epoch() {
+  local file="$1" value
+
+  value="$(stat -f '%m' "$file" 2>/dev/null || true)"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  value="$(stat -c '%Y' "$file" 2>/dev/null || true)"
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+display_cwd() {
+  local value="$1"
+  if [[ -n "${HOME:-}" && "$value" == "$HOME" ]]; then
+    printf '~\n'
+  elif [[ -n "${HOME:-}" && "$value" == "$HOME/"* ]]; then
+    local tilde='~'
+    printf '%s/%s\n' "$tilde" "${value#"$HOME/"}"
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+list_sessions() {
+  local sessions_dir="$codex_home/sessions"
+  [[ -d "$sessions_dir" ]] || fail "session directory does not exist: $sessions_dir"
+  command -v jq >/dev/null 2>&1 || fail "jq is required to list sessions"
+
+  local tmp_rows
+  tmp_rows="$(mktemp "${TMPDIR:-/tmp}/codexwait-list.XXXXXX")"
+  trap 'rm -f "$tmp_rows"' RETURN
+
+  local file base uuid mtime
+  while IFS= read -r -d '' file; do
+    base="${file##*/}"
+    if [[ "$base" =~ ([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}) ]]; then
+      uuid="${BASH_REMATCH[1]}"
+      mtime="$(file_mtime_epoch "$file" || true)"
+      [[ -n "$mtime" ]] || continue
+      printf '%s\t%s\n' "$mtime" "$uuid" >> "$tmp_rows"
+    fi
+  done < <(find "$sessions_dir" -type f -name 'rollout-*.jsonl' -print0 2>/dev/null)
+
+  [[ -s "$tmp_rows" ]] || {
+    echo "No Codex sessions found."
+    return 0
+  }
+
+  local -a ordered=() all_sessions=()
+  local row_uuid seen=''
+  while IFS=$'\t' read -r _ row_uuid; do
+    [[ -n "$row_uuid" ]] || continue
+    if [[ "$seen" == *$'\n'"$row_uuid"$'\n'* ]]; then
+      continue
+    fi
+    seen+=$'\n'"$row_uuid"$'\n'
+    ordered+=("$row_uuid")
+  done < <(sort -t $'\t' -k1,1nr "$tmp_rows")
+
+  all_sessions=("${ordered[@]}")
+
+  printf 'Recent Codex sessions:\n\n'
+  printf '  %-24s %s\n' 'SESSION' 'DIRECTORY'
+
+  local count=0 rollout recorded prefix shown_cwd
+  for uuid in "${ordered[@]}"; do
+    (( count >= list_limit )) && break
+    rollout="$(find_rollout_for_uuid "$uuid" || true)"
+    recorded=''
+    [[ -z "$rollout" ]] || recorded="$(read_recorded_cwd "$rollout" || true)"
+    prefix="$(shortest_unique_prefix "$uuid" "${all_sessions[@]}")"
+    if [[ -n "$recorded" ]]; then
+      shown_cwd="$(display_cwd "$recorded")"
+    else
+      shown_cwd='(unknown)'
+    fi
+    printf '  %-24s %s\n' "$prefix" "$shown_cwd"
+    count=$((count + 1))
+  done
+}
+
+if (( list_mode )); then
+  list_sessions
+  exit 0
+fi
+
+command -v codex >/dev/null 2>&1 || {
+  echo "codexwait: codex command not found" >&2
+  exit 127
 }
 
 resume_cwd=''

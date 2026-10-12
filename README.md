@@ -4,9 +4,23 @@
 
 It retries **only** when the Codex output looks like a usage/rate-limit failure. Other failures stop immediately.
 
+## Requirements
+
+- Codex CLI installed and authenticated (`codex` on `PATH`).
+- An existing Codex session to resume.
+- macOS or Linux. `--keep-awake` uses macOS `caffeinate` when available.
+
+When installed through Nix, `jq` and the other helper utilities used by `codexwait` are included automatically.
+
 ## Usage
 
 ```sh
+# Show recent sessions, newest first
+codexwait list
+
+# Show more sessions
+codexwait list --limit 20
+
 # Full UUID
 codexwait 01a1302e-0872-79b2-98c2-93f4299c6339
 
@@ -27,6 +41,20 @@ codexwait --keep-awake 01a1302e-0872
 ```
 
 By default, retries happen every 600 seconds.
+
+## Session listing
+
+`codexwait list` scans `$CODEX_HOME/sessions` and prints recent sessions in rollout-file modification order, which approximates most-recently-used order. It shows a short prefix that is unique among the sessions currently found plus the creation-time working directory recorded by Codex.
+
+```text
+Recent Codex sessions:
+
+  SESSION                  DIRECTORY
+  01a1302e-087             ~/src/macos-programmable-shell
+  01a1302e-08a             ~/src/codexwait
+```
+
+The session store is an internal Codex format, so listing may need updates if Codex changes its rollout layout.
 
 ## UUID prefixes
 
@@ -102,13 +130,50 @@ The limit-detection and active-writer regexes can be overridden with `CODEXWAIT_
 
 ## Nix
 
-Run directly:
+### From a local clone
+
+Run without installing:
 
 ```sh
-nix run github:OWNER/codexwait -- 01a1302e-0872
+nix run . -- list
+nix run . -- 01a1302e-0872
 ```
 
-Or add the package to your flake and include `codexwait` in `environment.systemPackages` / `home.packages`.
+Install into your user profile:
+
+```sh
+nix profile install .
+codexwait list
+```
+
+### From GitHub
+
+After the repository is published, replace `<owner>` with the GitHub owner:
+
+```sh
+nix run github:<owner>/codexwait -- list
+nix profile install github:<owner>/codexwait
+```
+
+### nix-darwin / Home Manager
+
+Add the flake as an input:
+
+```nix
+inputs.codexwait.url = "github:<owner>/codexwait";
+```
+
+Then add the package where you manage packages:
+
+```nix
+environment.systemPackages = [
+  inputs.codexwait.packages.${pkgs.system}.default
+];
+```
+
+For Home Manager, put the same package in `home.packages` instead.
+
+The Codex CLI itself is intentionally not bundled; `codexwait` expects an authenticated `codex` command to already be available.
 
 ## Development
 

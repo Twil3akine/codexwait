@@ -21,6 +21,9 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.codexwait}/bin/codexwait";
+          meta = {
+            description = "Resume Codex CLI work automatically when usage limits recover";
+          };
         };
       });
 
