@@ -2,10 +2,11 @@
 set -euo pipefail
 
 DEFAULT_PROMPT='Resume the previous work. First inspect the current git status and existing artifacts. Do not repeat completed work; continue from the unfinished part.'
-DEFAULT_LIMIT_REGEX='usage limit|rate limit|quota exceeded|too many requests|limit reached|try again after|reset at|reset.*[0-9]'
+DEFAULT_LIMIT_REGEX='usage limit|rate limit|quota exceeded|too many requests|limit reached|try again (after|at)|reset at|reset.*[0-9]'
 DEFAULT_ACTIVE_WRITER_REGEX='already has an active writer|thread-store conflict'
 
 interval="${CODEXWAIT_INTERVAL:-600}"
+reset_delay="${CODEXWAIT_RESET_DELAY:-10}"
 prompt="${CODEXWAIT_PROMPT:-$DEFAULT_PROMPT}"
 limit_regex="${CODEXWAIT_LIMIT_REGEX:-$DEFAULT_LIMIT_REGEX}"
 active_writer_regex="${CODEXWAIT_ACTIVE_WRITER_REGEX:-$DEFAULT_ACTIVE_WRITER_REGEX}"
@@ -29,20 +30,21 @@ SESSION may be:
   - a Codex session name
 
 Commands:
-  list                   Show recent Codex sessions, newest first.
+  list                   Show recent Codex sessions grouped by working directory.
 
 Options:
   --last                 Resume the most recent session.
-  -i, --interval SEC     Retry interval in seconds (default: 600).
+  -i, --interval SEC     Fallback retry interval in seconds (default: 600).
   -p, --prompt TEXT      Prompt appended when resuming.
   --max-attempts N       Stop after N attempts (0 = unlimited, default).
-  -C, --cwd DIR         Override the working directory used to resume.
+  -C, --cwd DIR          Override the working directory used to resume.
   --keep-awake           On macOS, use caffeinate while codexwait is running.
   -h, --help             Show this help.
 
 Environment:
   CODEX_HOME                    Codex data directory (default: ~/.codex).
-  CODEXWAIT_INTERVAL            Default retry interval.
+  CODEXWAIT_INTERVAL            Fallback retry interval.
+  CODEXWAIT_RESET_DELAY         Safety delay after a reported reset time (default: 10).
   CODEXWAIT_PROMPT              Default resume prompt.
   CODEXWAIT_LIMIT_REGEX         Regex used to recognize usage/rate-limit failures.
   CODEXWAIT_ACTIVE_WRITER_REGEX Regex used to recognize Codex active-writer conflicts.
@@ -81,60 +83,61 @@ if [[ "${1:-}" == "list" ]]; then
     esac
   done
 else
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --last)
-      use_last=1
-      shift
-      ;;
-    -i|--interval)
-      [[ $# -ge 2 ]] || fail "$1 requires a value"
-      interval="$2"
-      shift 2
-      ;;
-    -p|--prompt)
-      [[ $# -ge 2 ]] || fail "$1 requires a value"
-      prompt="$2"
-      shift 2
-      ;;
-    --max-attempts)
-      [[ $# -ge 2 ]] || fail "$1 requires a value"
-      max_attempts="$2"
-      shift 2
-      ;;
-    -C|--cwd)
-      [[ $# -ge 2 ]] || fail "$1 requires a value"
-      cwd_override="$2"
-      shift 2
-      ;;
-    --keep-awake)
-      keep_awake=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --)
-      shift
-      [[ $# -le 1 ]] || fail "too many positional arguments"
-      [[ $# -eq 0 ]] || session="$1"
-      break
-      ;;
-    -*)
-      fail "unknown option: $1"
-      ;;
-    *)
-      [[ -z "$session" ]] || fail "only one SESSION may be specified"
-      session="$1"
-      shift
-      ;;
-  esac
-done
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --last)
+        use_last=1
+        shift
+        ;;
+      -i|--interval)
+        [[ $# -ge 2 ]] || fail "$1 requires a value"
+        interval="$2"
+        shift 2
+        ;;
+      -p|--prompt)
+        [[ $# -ge 2 ]] || fail "$1 requires a value"
+        prompt="$2"
+        shift 2
+        ;;
+      --max-attempts)
+        [[ $# -ge 2 ]] || fail "$1 requires a value"
+        max_attempts="$2"
+        shift 2
+        ;;
+      -C|--cwd)
+        [[ $# -ge 2 ]] || fail "$1 requires a value"
+        cwd_override="$2"
+        shift 2
+        ;;
+      --keep-awake)
+        keep_awake=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        [[ $# -le 1 ]] || fail "too many positional arguments"
+        [[ $# -eq 0 ]] || session="$1"
+        break
+        ;;
+      -*)
+        fail "unknown option: $1"
+        ;;
+      *)
+        [[ -z "$session" ]] || fail "only one SESSION may be specified"
+        session="$1"
+        shift
+        ;;
+    esac
+  done
 fi
 
 is_uint "$interval" || fail "interval must be a non-negative integer"
 (( interval > 0 )) || fail "interval must be greater than zero"
+is_uint "$reset_delay" || fail "reset delay must be a non-negative integer"
 is_uint "$max_attempts" || fail "max-attempts must be a non-negative integer"
 is_uint "$list_limit" || fail "list limit must be a positive integer"
 (( list_limit > 0 )) || fail "list limit must be greater than zero"
@@ -173,13 +176,11 @@ resolve_session() {
   local compact
   compact="$(printf '%s' "$value" | tr -d '-')"
 
-  # Full UUID: pass through unchanged.
   if [[ "$value" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
     printf '%s\n' "$value"
     return 0
   fi
 
-  # Only treat 8+ hex chars as a UUID prefix. Other values are session names.
   if [[ ! "$compact" =~ ^[0-9A-Fa-f]{8,31}$ ]]; then
     printf '%s\n' "$value"
     return 0
@@ -201,7 +202,6 @@ resolve_session() {
     fi
   done < <(find "$sessions_dir" -type f -name 'rollout-*.jsonl' -print0 2>/dev/null)
 
-  # Deduplicate IDs, because a session can have more than one rollout file.
   if ((${#matches[@]} > 0)); then
     mapfile -t matches < <(printf '%s\n' "${matches[@]}" | sort -u)
   fi
@@ -242,9 +242,6 @@ find_rollout_for_uuid() {
   [[ -d "$sessions_dir" ]] || return 1
 
   while IFS= read -r -d '' file; do
-    # Prefer the earliest rollout path for this UUID. A later resume attempt can
-    # record a different turn cwd, but the creation-time session_meta is the
-    # stable project directory we want for unattended resume.
     if [[ -z "$best" || "$file" < "$best" ]]; then
       best="$file"
     fi
@@ -291,6 +288,19 @@ file_mtime_epoch() {
   printf '%s\n' "$value"
 }
 
+format_epoch_local() {
+  local epoch="$1" value
+  value="$(date -r "$epoch" '+%m-%d %H:%M' 2>/dev/null || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  value="$(date -d "@$epoch" '+%m-%d %H:%M' 2>/dev/null || true)"
+  [[ -n "$value" ]] || return 1
+  printf '%s\n' "$value"
+}
+
 display_cwd() {
   local value="$1"
   if [[ -n "${HOME:-}" && "$value" == "$HOME" ]]; then
@@ -328,36 +338,60 @@ list_sessions() {
     return 0
   }
 
-  local -a ordered=() all_sessions=()
-  local row_uuid seen=''
-  while IFS=$'\t' read -r _ row_uuid; do
+  local -a ordered=() ordered_mtimes=() all_sessions=()
+  local row_mtime row_uuid seen=''
+  while IFS=$'\t' read -r row_mtime row_uuid; do
     [[ -n "$row_uuid" ]] || continue
     if [[ "$seen" == *$'\n'"$row_uuid"$'\n'* ]]; then
       continue
     fi
     seen+=$'\n'"$row_uuid"$'\n'
     ordered+=("$row_uuid")
+    ordered_mtimes+=("$row_mtime")
   done < <(sort -t $'\t' -k1,1nr "$tmp_rows")
 
   all_sessions=("${ordered[@]}")
 
-  printf 'Recent Codex sessions:\n\n'
-  printf '  %-24s %s\n' 'SESSION' 'DIRECTORY'
+  local selected_count="${#ordered[@]}"
+  (( selected_count > list_limit )) && selected_count="$list_limit"
 
-  local count=0 rollout recorded prefix shown_cwd
-  for uuid in "${ordered[@]}"; do
-    (( count >= list_limit )) && break
+  local -a selected_uuids=() selected_mtimes=() selected_cwds=() selected_prefixes=()
+  local i rollout recorded shown_cwd prefix
+  for ((i = 0; i < selected_count; i++)); do
+    uuid="${ordered[$i]}"
     rollout="$(find_rollout_for_uuid "$uuid" || true)"
     recorded=''
     [[ -z "$rollout" ]] || recorded="$(read_recorded_cwd "$rollout" || true)"
-    prefix="$(shortest_unique_prefix "$uuid" "${all_sessions[@]}")"
     if [[ -n "$recorded" ]]; then
       shown_cwd="$(display_cwd "$recorded")"
     else
       shown_cwd='(unknown)'
     fi
-    printf '  %-24s %s\n' "$prefix" "$shown_cwd"
-    count=$((count + 1))
+    prefix="$(shortest_unique_prefix "$uuid" "${all_sessions[@]}")"
+    selected_uuids+=("$uuid")
+    selected_mtimes+=("${ordered_mtimes[$i]}")
+    selected_cwds+=("$shown_cwd")
+    selected_prefixes+=("$prefix")
+  done
+
+  printf 'Recent Codex sessions:\n\n'
+
+  local printed_groups=$'\n' group j last_used
+  for ((i = 0; i < selected_count; i++)); do
+    group="${selected_cwds[$i]}"
+    if [[ "$printed_groups" == *$'\n'"$group"$'\n'* ]]; then
+      continue
+    fi
+    printed_groups+="$group"$'\n'
+
+    printf '%s\n' "$group"
+    printf '  %-24s %s\n' 'SESSION' 'LAST USED'
+    for ((j = 0; j < selected_count; j++)); do
+      [[ "${selected_cwds[$j]}" == "$group" ]] || continue
+      last_used="$(format_epoch_local "${selected_mtimes[$j]}" || printf '?')"
+      printf '  %-24s %s\n' "${selected_prefixes[$j]}" "$last_used"
+    done
+    printf '\n'
   done
 }
 
@@ -405,8 +439,6 @@ chmod 700 "$lock_root" 2>/dev/null || true
 
 lock_target="$session"
 if (( use_last )); then
-  # --last cannot be mapped to a stable session UUID before Codex resolves it,
-  # so reserve a singleton --last slot. Explicit session reservations remain separate.
   lock_target='__last__'
 fi
 
@@ -470,7 +502,6 @@ acquire_lock() {
     return 1
   fi
 
-  # Dead/missing owner: treat as stale and replace once.
   rm -rf "$lock_dir"
   if mkdir "$lock_dir" 2>/dev/null; then
     lock_owned=1
@@ -492,6 +523,39 @@ if (( keep_awake )); then
     echo "codexwait: --keep-awake requested, but caffeinate is unavailable; continuing" >&2
   fi
 fi
+
+reported_reset_sleep_seconds() {
+  local output_file="$1"
+  local match parsed hour minute ampm hour24 now_h now_m now_s now_seconds target_seconds delay
+
+  match="$(grep -Eio 'try again at[[:space:]]+[0-9]{1,2}:[0-9]{2}[[:space:]]*(AM|PM)' "$output_file" | tail -n 1 || true)"
+  [[ -n "$match" ]] || return 1
+
+  parsed="$(printf '%s\n' "$match" | sed -E 's/.*[Aa][Tt][[:space:]]+([0-9]{1,2}):([0-9]{2})[[:space:]]*([AaPp][Mm]).*/\1 \2 \3/')"
+  read -r hour minute ampm <<< "$parsed"
+
+  [[ "$hour" =~ ^[0-9]{1,2}$ && "$minute" =~ ^[0-9]{2}$ && "$ampm" =~ ^[AaPp][Mm]$ ]] || return 1
+  hour=$((10#$hour))
+  minute=$((10#$minute))
+  (( hour >= 1 && hour <= 12 && minute >= 0 && minute <= 59 )) || return 1
+
+  hour24=$((hour % 12))
+  if [[ "${ampm^^}" == "PM" ]]; then
+    hour24=$((hour24 + 12))
+  fi
+
+  read -r now_h now_m now_s <<< "$(date '+%H %M %S')"
+  [[ "$now_h" =~ ^[0-9]{2}$ && "$now_m" =~ ^[0-9]{2}$ && "$now_s" =~ ^[0-9]{2}$ ]] || return 1
+
+  now_seconds=$((10#$now_h * 3600 + 10#$now_m * 60 + 10#$now_s))
+  target_seconds=$((hour24 * 3600 + minute * 60))
+  delay=$((target_seconds - now_seconds))
+  if (( delay <= 0 )); then
+    delay=$((delay + 86400))
+  fi
+
+  printf '%d\n' "$((delay + reset_delay))"
+}
 
 tmp="$(mktemp "${TMPDIR:-/tmp}/codexwait.XXXXXX")"
 attempt=0
@@ -533,6 +597,12 @@ EOF_WRITER
     exit "$status"
   fi
 
-  printf '[%s] usage/rate limit detected; retrying in %ds.\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$interval"
-  sleep "$interval"
+  reset_sleep="$(reported_reset_sleep_seconds "$tmp" || true)"
+  if [[ -n "$reset_sleep" ]]; then
+    printf '[%s] usage/rate limit detected; reported reset time found, retrying in %ds.\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$reset_sleep"
+    sleep "$reset_sleep"
+  else
+    printf '[%s] usage/rate limit detected; retrying in %ds.\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$interval"
+    sleep "$interval"
+  fi
 done
